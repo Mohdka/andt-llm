@@ -1,19 +1,30 @@
 package com.andet.llm
 
+import android.app.DownloadManager
+import android.content.Context
+import android.net.Uri
 import android.os.Bundle
+import android.provider.OpenableColumns
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.FileOpen
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import java.io.File
+import java.io.FileOutputStream
+import java.io.InputStream
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -27,17 +38,64 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+fun getFileName(context: Context, uri: Uri): String? {
+    var name: String? = null
+    if (uri.scheme == "content") {
+        val cursor = context.contentResolver.query(uri, null, null, null, null)
+        cursor?.use {
+            if (it.moveToFirst()) {
+                val nameIndex = it.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                if (nameIndex >= 0) {
+                    name = it.getString(nameIndex)
+                }
+            }
+        }
+    }
+    if (name == null) {
+        name = uri.path
+        val cut = name?.lastIndexOf('/')
+        if (cut != -1 && cut != null) {
+            name = name?.substring(cut + 1)
+        }
+    }
+    return name
+}
+
 data class Message(val role: String, val content: String)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen(modelManager: ModelManager) {
-    val models = remember { modelManager.listModels() }
-    var selectedModel by remember { mutableStateOf(models.firstOrNull()) }
+    val context = LocalContext.current
+    val models = remember { mutableStateOf(modelManager.listModels()) }
+    var selectedModel by remember { mutableStateOf(models.value.firstOrNull()) }
     var prompt by remember { mutableStateOf("") }
     var messages by remember { mutableStateOf(listOf<Message>()) }
     var generating by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("Place GGUF files in ${modelManager.getModelsDir().absolutePath}") }
+    var showHfDialog by remember { mutableStateOf(false) }
+    var hfUrl by remember { mutableStateOf("") }
+
+    val filePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        uri?.let {
+            try {
+                val inputStream: InputStream? = context.contentResolver.openInputStream(it)
+                val fileName = getFileName(context, it) ?: "model.gguf"
+                val destFile = File(modelManager.getModelsDir(), fileName)
+                inputStream?.use { input ->
+                    FileOutputStream(destFile).use { output ->
+                        input.copyTo(output)
+                    }
+                }
+                models.value = modelManager.listModels()
+                status = "✓ Imported ${destFile.name}"
+            } catch (e: Exception) {
+                status = "Error: ${e.message}"
+            }
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -66,14 +124,14 @@ fun ChatScreen(modelManager: ModelManager) {
                 )
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
-                    if (models.isEmpty()) {
+                    if (models.value.isEmpty()) {
                         Text(
                             "No GGUF models found",
                             style = MaterialTheme.typography.titleSmall
                         )
                         Spacer(Modifier.height(4.dp))
                         Text(
-                            "Add .gguf files to ${modelManager.getModelsDir().absolutePath}",
+                            "Import a model below",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -90,7 +148,7 @@ fun ChatScreen(modelManager: ModelManager) {
                                 shape = MaterialTheme.shapes.medium
                             )
                             ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-                                models.forEach { model ->
+                                models.value.forEach { model ->
                                     DropdownMenuItem(
                                         text = { Text(model.name) },
                                         onClick = {
@@ -108,12 +166,86 @@ fun ChatScreen(modelManager: ModelManager) {
                         }
                     }
                     Spacer(Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = { filePickerLauncher.launch(arrayOf("*/*")) },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(Icons.Default.FileOpen, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("Import File")
+                        }
+                        OutlinedButton(
+                            onClick = { showHfDialog = true },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("From HF")
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
                     Text(
                         status,
                         style = MaterialTheme.typography.bodySmall,
                         color = if (status.startsWith("✓")) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
+            }
+
+            if (showHfDialog) {
+                AlertDialog(
+                    onDismissRequest = { showHfDialog = false },
+                    title = { Text("Download from HuggingFace") },
+                    text = {
+                        Column {
+                            Text(
+                                "Paste the direct GGUF download URL",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            Spacer(Modifier.height(8.dp))
+                            OutlinedTextField(
+                                value = hfUrl,
+                                onValueChange = { hfUrl = it },
+                                label = { Text("URL") },
+                                placeholder = { Text("https://huggingface.co/.../resolve/main/model.gguf") },
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+                    },
+                    confirmButton = {
+                        TextButton(
+                            onClick = {
+                                if (hfUrl.isNotBlank()) {
+                                    try {
+                                        val request = DownloadManager.Request(Uri.parse(hfUrl))
+                                        val fileName = hfUrl.substringAfterLast("/").substringBefore("?")
+                                        request.setDestinationInExternalFilesDir(context, "models", fileName)
+                                        request.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                                        request.setTitle("Downloading $fileName")
+                                        val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+                                        dm.enqueue(request)
+                                        status = "Downloading $fileName..."
+                                        showHfDialog = false
+                                        hfUrl = ""
+                                    } catch (e: Exception) {
+                                        status = "Error: ${e.message}"
+                                    }
+                                }
+                            }
+                        ) {
+                            Text("Download")
+                        }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { showHfDialog = false }) {
+                            Text("Cancel")
+                        }
+                    }
+                )
             }
 
             Spacer(Modifier.height(16.dp))
@@ -281,4 +413,27 @@ fun ChatScreen(modelManager: ModelManager) {
             }
         }
     }
+}
+
+fun getFileName(context: Context, uri: Uri): String? {
+    var name: String? = null
+    if (uri.scheme == "content") {
+        val cursor = context.contentResolver.query(uri, null, null, null, null)
+        cursor?.use {
+            if (it.moveToFirst()) {
+                val nameIndex = it.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                if (nameIndex >= 0) {
+                    name = it.getString(nameIndex)
+                }
+            }
+        }
+    }
+    if (name == null) {
+        name = uri.path
+        val cut = name?.lastIndexOf('/')
+        if (cut != -1 && cut != null) {
+            name = name?.substring(cut + 1)
+        }
+    }
+    return name
 }
